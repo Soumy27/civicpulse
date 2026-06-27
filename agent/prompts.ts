@@ -41,9 +41,12 @@ export const AGENT_KICKOFF =
   "issues at once; in the NEXT step take all their actions at once per the rules " +
   "(escalate / flag_low_confidence / merge / request_evidence / update_status). " +
   "If an escalate_issue returns success:false, immediately call it again with " +
-  "alternativeDept in that SAME step (self-correction). Finally call log_decision " +
-  "for every action together in one step. Finish in 5 steps or fewer, but still " +
-  "make at least 6 tool calls total.";
+  "alternativeDept set to a higher authority such as the Municipal Commissioner's " +
+  "Office in that SAME step (self-correction), and set isSelfCorrection=true on its " +
+  "log_decision. IMPORTANT: ALWAYS include in your 3 picks any issue whose " +
+  "escalationAttempts is 1 or more — that issue had a failed escalation and MUST be " +
+  "re-escalated with an alternativeDept. Finally call log_decision for every action " +
+  "together in one step. Finish in 5 steps or fewer, but make at least 6 tool calls total.";
 
 // ── Classification (vision) ──────────────────────────────────
 export const CLASSIFY_PROMPT = `Analyze this image for a civic infrastructure issue.

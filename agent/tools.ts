@@ -302,6 +302,13 @@ export async function log_decision(args: {
   isSelfCorrection?: boolean;
 }): Promise<ToolResult> {
   const issue = await getIssue(args.issueId);
+  // Robust self-correction flag: trust the model's boolean, but also infer it
+  // from the text (the model reliably describes the retry even when it forgets
+  // the flag) and from a real prior failed escalation on this issue.
+  const text = `${args.reasoning} ${args.actionTaken}`.toLowerCase();
+  const isSelfCorrection =
+    Boolean(args.isSelfCorrection) ||
+    /self.?correct|retry|alternative (dept|authority|department)|failed escalation/.test(text);
   await db().from(T.activity).insert({
     issue_id: args.issueId,
     issue_category: issue?.category ?? "unknown",
@@ -311,7 +318,7 @@ export async function log_decision(args: {
     action_detail: args.actionTaken,
     confidence_score: args.confidenceScore,
     chain_step: args.chainStep,
-    is_self_correction: Boolean(args.isSelfCorrection),
+    is_self_correction: isSelfCorrection,
   });
   return { success: true, logged: true, chainStep: args.chainStep };
 }
