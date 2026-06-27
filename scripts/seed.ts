@@ -1,58 +1,44 @@
 /**
- * Pre-demo data seeder. Run with:  npm run seed
- *
- * Wipes the demo collections and loads:
- *  - 8 spec issues that each trigger a distinct agent action
- *  - a resolved pothole cluster so the predictor produces a hotspot
- *  - agentMemory for Issue 3 (prior failed escalation → self-correction)
- *  - cityMetrics, wards, and two demo users
- *
- * Uses relative imports + a tiny .env loader so it runs under tsx without
- * any path-alias or dotenv setup.
+ * Pre-demo data seeder for Supabase. Run with:  npm run seed
+ * Loads 8 spec issues + a resolved pothole cluster (predictions) + recently
+ * resolved fillers (healthy Civic Score) + agent_memory for issue-3
+ * (self-correction) + wards, profiles, and city_metrics.
  */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-// ── minimal .env loader (.env.local wins over .env) ──────────
 function loadEnv() {
   for (const file of [".env.local", ".env"]) {
     try {
       const text = readFileSync(resolve(process.cwd(), file), "utf8");
       for (const line of text.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-        const eq = trimmed.indexOf("=");
+        const t = line.trim();
+        if (!t || t.startsWith("#")) continue;
+        const eq = t.indexOf("=");
         if (eq === -1) continue;
-        const key = trimmed.slice(0, eq).trim();
-        let val = trimmed.slice(eq + 1).trim();
-        if (
-          (val.startsWith('"') && val.endsWith('"')) ||
-          (val.startsWith("'") && val.endsWith("'"))
-        ) {
+        const key = t.slice(0, eq).trim();
+        let val = t.slice(eq + 1).trim();
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'")))
           val = val.slice(1, -1);
-        }
         if (!(key in process.env)) process.env[key] = val;
       }
     } catch {
-      /* file optional */
+      /* optional */
     }
   }
 }
 loadEnv();
 
-import { db, Timestamp } from "../lib/firebase-admin";
+import { admin, T } from "../lib/supabase-admin";
 import { recomputeAndPersistCivicScore } from "../lib/civicScore";
 import { inferWardId } from "../lib/maps";
 import { badgeForXp } from "../lib/xp";
 import { DEFAULT_DEPARTMENTS, type IssueCategory, type Severity } from "../lib/types";
 
-const HOUR = 60 * 60 * 1000;
+const HOUR = 3600_000;
 const DAY = 24 * HOUR;
 const now = Date.now();
-
-function ts(ms: number) {
-  return Timestamp.fromMillis(ms);
-}
+const iso = (ms: number) => new Date(ms).toISOString();
 
 interface SeedIssue {
   id: string;
@@ -64,7 +50,7 @@ interface SeedIssue {
   lat: number;
   lng: number;
   aiConfidence?: number;
-  resolvedAgeMs?: number; // for resolved issues: how long ago resolved
+  resolvedAgeMs?: number;
 }
 
 const ISSUES: SeedIssue[] = [
@@ -78,7 +64,6 @@ const ISSUES: SeedIssue[] = [
   { id: "issue-8", category: "water_leakage", severity: "high", ageMs: 2 * DAY, verifications: 5, status: "resolved", lat: 22.7216, lng: 75.8614, resolvedAgeMs: 2 * DAY },
 ];
 
-// Resolved pothole cluster (no open issue nearby) → predictor emits a hotspot.
 const HISTORY: SeedIssue[] = [
   { id: "hist-1", category: "pothole", severity: "high", ageMs: 40 * DAY, verifications: 6, status: "resolved", lat: 22.7305, lng: 75.865, resolvedAgeMs: 30 * DAY },
   { id: "hist-2", category: "pothole", severity: "medium", ageMs: 55 * DAY, verifications: 4, status: "resolved", lat: 22.7308, lng: 75.8655, resolvedAgeMs: 48 * DAY },
@@ -86,17 +71,10 @@ const HISTORY: SeedIssue[] = [
   { id: "hist-4", category: "pothole", severity: "medium", ageMs: 80 * DAY, verifications: 3, status: "resolved", lat: 22.731, lng: 75.8658, resolvedAgeMs: 75 * DAY },
 ];
 
-/**
- * Recently-resolved issues (this month) so the Civic Score reflects a healthy
- * city (~74) rather than cratering on a low resolution rate. Spread >1km apart
- * across mixed categories so they never form a 500m prediction cluster, and
- * resolved within the last 28 days so they count toward totalResolvedThisMonth.
- * Backs the spec's `totalResolvedThisMonth: 23`.
- */
 const RECENT_RESOLVED: SeedIssue[] = Array.from({ length: 22 }, (_, i) => {
   const cats: IssueCategory[] = ["pothole", "water_leakage", "broken_streetlight", "garbage", "other"];
   const sev: Severity[] = ["low", "medium", "high"];
-  const resolvedDays = 2 + (i % 27); // 2..28 days ago
+  const resolvedDays = 2 + (i % 27);
   return {
     id: `resolved-${i + 1}`,
     category: cats[i % cats.length]!,
@@ -104,7 +82,6 @@ const RECENT_RESOLVED: SeedIssue[] = Array.from({ length: 22 }, (_, i) => {
     ageMs: (resolvedDays + 3) * DAY,
     verifications: 3 + (i % 4),
     status: "resolved",
-    // Grid spread ~1.3km apart (0.012deg) so no two share a 500m cluster.
     lat: 22.66 + (i % 6) * 0.012,
     lng: 75.82 + Math.floor(i / 6) * 0.012,
     resolvedAgeMs: resolvedDays * DAY,
@@ -119,145 +96,109 @@ const DESCRIPTIONS: Record<IssueCategory, string> = {
   other: "Civic issue reported by a citizen.",
 };
 
-async function wipe(collection: string) {
-  const snap = await db().collection(collection).get();
-  const batch = db().batch();
-  snap.docs.forEach((d) => batch.delete(d.ref));
-  await batch.commit();
-  console.log(`  wiped ${snap.size} docs from ${collection}`);
-}
-
-async function seedIssue(s: SeedIssue, reporterId: string) {
+function issueRow(s: SeedIssue, reporterId: string) {
   const created = now - s.ageMs;
   const resolved = s.resolvedAgeMs != null ? now - s.resolvedAgeMs : created;
-  const verifierIds = Array.from({ length: s.verifications }, (_, i) => `verifier-${i + 1}`);
-  await db()
-    .collection("issues")
-    .doc(s.id)
-    .set({
-      reporterId,
-      photoUrl: `https://picsum.photos/seed/${s.id}/800/600`,
-      lat: s.lat,
-      lng: s.lng,
-      address: `${s.lat.toFixed(4)}, ${s.lng.toFixed(4)}, Indore`,
-      wardId: inferWardId(s.lat, s.lng),
-      category: s.category,
-      severity: s.severity,
-      aiDescription: DESCRIPTIONS[s.category],
-      aiConfidence: s.aiConfidence ?? (s.severity === "high" ? 92 : 78),
-      department: DEFAULT_DEPARTMENTS[s.category],
-      extractedEntities: ["MG Road", "Indore"],
-      predictedResolutionMinDays: 3,
-      predictedResolutionMaxDays: 6,
-      status: s.status,
-      isPredicted: false,
-      verifierIds,
-      verificationCount: s.verifications,
-      agentReviewCount: 0,
-      lastAgentReviewAt: null,
-      escalatedAt: null,
-      escalationDept: null,
-      escalationAttempts: 0,
-      mergedIntoIssueId: null,
-      createdAt: ts(created),
-      updatedAt: ts(s.status === "resolved" ? resolved : created),
-    });
+  return {
+    id: s.id,
+    reporter_id: reporterId,
+    photo_url: `https://picsum.photos/seed/${s.id}/800/600`,
+    lat: s.lat,
+    lng: s.lng,
+    address: `${s.lat.toFixed(4)}, ${s.lng.toFixed(4)}, Indore`,
+    ward_id: inferWardId(s.lat, s.lng),
+    category: s.category,
+    severity: s.severity,
+    ai_description: DESCRIPTIONS[s.category],
+    ai_confidence: s.aiConfidence ?? (s.severity === "high" ? 92 : 78),
+    department: DEFAULT_DEPARTMENTS[s.category],
+    extracted_entities: ["MG Road", "Indore"],
+    predicted_resolution_min_days: 3,
+    predicted_resolution_max_days: 6,
+    status: s.status,
+    is_predicted: false,
+    verifier_ids: Array.from({ length: s.verifications }, (_, i) => `verifier-${i + 1}`),
+    verification_count: s.verifications,
+    escalation_attempts: s.id === "issue-3" ? 1 : 0,
+    created_at: iso(created),
+    updated_at: iso(s.status === "resolved" ? resolved : created),
+  };
+}
+
+async function wipe(table: string, col: string, sentinel = "__never__") {
+  const { error } = await admin().from(table).delete().neq(col, sentinel);
+  if (error) console.error(`wipe ${table}:`, error.message);
 }
 
 async function main() {
-  console.log("Seeding CivicPulse demo data...");
-  for (const c of ["issues", "agentActivity", "agentMemory", "wards", "departments"]) {
-    await wipe(c);
-  }
+  console.log("Seeding CivicPulse (Supabase)...");
+  const db = admin();
 
-  console.log("Seeding issues...");
-  for (const s of ISSUES) await seedIssue(s, "demo-user-1");
-  for (const s of HISTORY) await seedIssue(s, "demo-user-2");
-  for (const s of RECENT_RESOLVED) await seedIssue(s, "demo-user-2");
+  await wipe(T.activity, "id", "00000000-0000-0000-0000-000000000000");
+  await wipe(T.issues, "id");
+  await wipe(T.memory, "issue_id");
+  await wipe(T.wards, "ward_id");
+  await wipe(T.profiles, "uid");
+  await wipe(T.metrics, "id");
 
-  // Issue 3: prior failed escalation → forces self-correction next cycle.
-  console.log("Seeding agentMemory (issue-3 self-correction setup)...");
-  await db()
-    .collection("agentMemory")
-    .doc("issue-3")
-    .set({
-      issueId: "issue-3",
-      lastAction: "escalated to Water Supply Board",
-      lastActionAt: ts(now - 2 * DAY),
-      actionHistory: [`${new Date(now - 2 * DAY).toISOString()} — escalated to Water Supply Board`],
-      cooldownUntil: ts(now - HOUR), // expired → not in cooldown
-      escalationAttempts: 1,
-    });
-  // Mirror escalationAttempts onto the issue so the tool sees the prior attempt.
-  await db().collection("issues").doc("issue-3").set({ escalationAttempts: 1 }, { merge: true });
+  console.log("Inserting issues...");
+  const rows = [
+    ...ISSUES.map((s) => issueRow(s, "demo-user-1")),
+    ...HISTORY.map((s) => issueRow(s, "demo-user-2")),
+    ...RECENT_RESOLVED.map((s) => issueRow(s, "demo-user-2")),
+  ];
+  const { error: insErr } = await db.from(T.issues).insert(rows);
+  if (insErr) throw new Error("issue insert: " + insErr.message);
 
-  console.log("Seeding department FCM placeholders...");
-  for (const dept of Object.values(DEFAULT_DEPARTMENTS).concat(["Municipal Commissioner's Office"])) {
-    const slug = dept.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-    await db().collection("departments").doc(slug).set({ name: dept, fcmToken: "" });
-  }
+  console.log("Seeding agent_memory (issue-3 self-correction)...");
+  await db.from(T.memory).insert({
+    issue_id: "issue-3",
+    last_action: "escalated to Water Supply Board",
+    last_action_at: iso(now - 2 * DAY),
+    action_history: [`${iso(now - 2 * DAY)} — escalated to Water Supply Board`],
+    cooldown_until: iso(now - HOUR),
+    escalation_attempts: 1,
+  });
 
   console.log("Seeding wards...");
   const wardAgg = new Map<string, { reported: number; resolved: number }>();
   for (const s of [...ISSUES, ...HISTORY, ...RECENT_RESOLVED]) {
     const w = inferWardId(s.lat, s.lng);
-    const agg = wardAgg.get(w) ?? { reported: 0, resolved: 0 };
-    agg.reported++;
-    if (s.status === "resolved") agg.resolved++;
-    wardAgg.set(w, agg);
+    const a = wardAgg.get(w) ?? { reported: 0, resolved: 0 };
+    a.reported++;
+    if (s.status === "resolved") a.resolved++;
+    wardAgg.set(w, a);
   }
-  for (const [wardId, agg] of wardAgg) {
-    const healthScore = Math.round(50 + (agg.resolved / Math.max(1, agg.reported)) * 50);
-    await db()
-      .collection("wards")
-      .doc(wardId)
-      .set({
-        wardId,
-        wardName: `Indore Ward ${wardId.split("-")[1]}`,
-        totalReported: agg.reported,
-        totalResolved: agg.resolved,
-        totalPredicted: 0,
-        avgResolutionDays: 4.2,
-        healthScore,
-        lastUpdated: ts(now),
-      });
-  }
+  await db.from(T.wards).insert(
+    Array.from(wardAgg).map(([wardId, a]) => ({
+      ward_id: wardId,
+      ward_name: `Indore Ward ${wardId.split("-")[1]}`,
+      total_reported: a.reported,
+      total_resolved: a.resolved,
+      total_predicted: 0,
+      avg_resolution_days: 4.2,
+      health_score: Math.round(50 + (a.resolved / Math.max(1, a.reported)) * 50),
+      last_updated: iso(now),
+    }))
+  );
 
-  console.log("Seeding users...");
-  await db().collection("users").doc("demo-user-1").set({
-    uid: "demo-user-1",
-    displayName: "Aarav Sharma",
-    photoURL: "",
-    xp: 85,
-    badge: badgeForXp(85),
-    wardId: "ward-1",
-    reportedIssueIds: ISSUES.filter((i) => i.status !== "resolved").map((i) => i.id),
-    verifiedIssueIds: [],
-    fcmToken: "",
-  });
-  await db().collection("users").doc("demo-user-2").set({
-    uid: "demo-user-2",
-    displayName: "Priya Verma",
-    photoURL: "",
-    xp: 210,
-    badge: badgeForXp(210),
-    wardId: "ward-2",
-    reportedIssueIds: HISTORY.map((i) => i.id),
-    verifiedIssueIds: [],
-    fcmToken: "",
-  });
+  console.log("Seeding profiles...");
+  await db.from(T.profiles).insert([
+    { uid: "demo-user-1", display_name: "Aarav Sharma", xp: 85, badge: badgeForXp(85), ward_id: "ward-1", reported_issue_ids: ISSUES.filter((i) => i.status !== "resolved").map((i) => i.id), verified_issue_ids: [] },
+    { uid: "demo-user-2", display_name: "Priya Verma", xp: 210, badge: badgeForXp(210), ward_id: "ward-2", reported_issue_ids: HISTORY.map((i) => i.id), verified_issue_ids: [] },
+  ]);
 
-  console.log("Seeding cityMetrics (baseline 74) ...");
-  await db().collection("cityMetrics").doc("current").set({
-    civicScore: 74,
-    totalOpenIssues: 7,
-    totalResolvedThisMonth: 23,
-    avgResolutionDays: 4.2,
-    activeWardsCount: wardAgg.size,
-    weeklyDelta: 3,
-    lastUpdated: ts(now),
+  console.log("Seeding city_metrics + recompute...");
+  await db.from(T.metrics).insert({
+    id: "current",
+    civic_score: 74,
+    total_open_issues: 7,
+    total_resolved_this_month: 23,
+    avg_resolution_days: 4.2,
+    active_wards_count: wardAgg.size,
+    weekly_delta: 3,
+    last_updated: iso(now),
   });
-  // Recompute so the persisted score reflects the seeded issues exactly.
   const metrics = await recomputeAndPersistCivicScore(now);
   console.log(`  civicScore recomputed → ${metrics.civicScore}`);
 

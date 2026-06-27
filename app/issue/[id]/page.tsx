@@ -1,11 +1,10 @@
 "use client";
 
 import Image from "next/image";
-import { GoogleMap, Marker } from "@react-google-maps/api";
 import { MapPin, Users } from "lucide-react";
 import { useIssue } from "@/lib/hooks";
 import { useAuth } from "@/lib/auth-context";
-import { useGoogleMaps } from "@/lib/useGoogleMaps";
+import { MiniMap } from "@/components/map/MiniMap";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { CategoryBadge } from "@/components/shared/CategoryBadge";
@@ -21,7 +20,6 @@ export default function IssueDetailPage({ params }: { params: { id: string } }) 
   const { id } = params;
   const { data: issue, loading } = useIssue(id);
   const { user } = useAuth();
-  const { isLoaded } = useGoogleMaps();
 
   if (loading) {
     return (
@@ -112,18 +110,7 @@ export default function IssueDetailPage({ params }: { params: { id: string } }) 
           </CardHeader>
           <CardContent className="space-y-2">
             <div className="h-40 w-full overflow-hidden rounded-lg">
-              {isLoaded ? (
-                <GoogleMap
-                  mapContainerStyle={{ width: "100%", height: "100%" }}
-                  center={{ lat: issue.lat, lng: issue.lng }}
-                  zoom={16}
-                  options={{ disableDefaultUI: true, gestureHandling: "none" }}
-                >
-                  <Marker position={{ lat: issue.lat, lng: issue.lng }} />
-                </GoogleMap>
-              ) : (
-                <div className="shimmer h-full w-full" />
-              )}
+              <MiniMap lat={issue.lat} lng={issue.lng} />
             </div>
             <p className="text-sm text-muted-foreground">{issue.address}</p>
           </CardContent>

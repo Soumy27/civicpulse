@@ -1,16 +1,14 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: "standalone",
   reactStrictMode: true,
   images: {
     remotePatterns: [
-      { protocol: "https", hostname: "firebasestorage.googleapis.com" },
-      { protocol: "https", hostname: "lh3.googleusercontent.com" },
-      { protocol: "https", hostname: "storage.googleapis.com" },
+      { protocol: "https", hostname: "*.supabase.co" },
+      { protocol: "https", hostname: "picsum.photos" },
     ],
   },
   eslint: {
-    // Keep the demo build green even if lint nits exist.
+    // Keep builds green even if lint nits exist.
     ignoreDuringBuilds: true,
   },
 };

@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import Image from "next/image";
-import { LogIn, LogOut, UserCircle } from "lucide-react";
+import { useState } from "react";
+import { LogOut, Mail, UserCircle } from "lucide-react";
 import { useAuth } from "@/lib/auth-context";
 import { useIssues, useUserProfile } from "@/lib/hooks";
 import { Button } from "@/components/ui/button";
@@ -13,9 +14,11 @@ import { CategoryBadge } from "@/components/shared/CategoryBadge";
 import { BADGE_EMOJI, BADGE_LABELS } from "@/lib/xp";
 
 export default function ProfilePage() {
-  const { user, loading, signInGoogle, signInGuest, signOut } = useAuth();
+  const { user, loading, signInEmail, signInGuest, signOut } = useAuth();
   const { data: profile } = useUserProfile(user?.uid);
   const { data: allIssues } = useIssues();
+  const [email, setEmail] = useState("");
+  const [emailSent, setEmailSent] = useState(false);
 
   if (loading) {
     return <div className="mx-auto max-w-3xl px-4 py-10"><div className="shimmer h-40 rounded-xl" /></div>;
@@ -30,9 +33,29 @@ export default function ProfilePage() {
           Track your reports, earn XP, and climb the ward leaderboard.
         </p>
         <div className="flex w-full flex-col gap-2">
-          <Button onClick={signInGoogle} size="lg">
-            <LogIn className="h-4 w-4" /> Continue with Google
-          </Button>
+          {emailSent ? (
+            <p className="rounded-lg bg-green-50 p-3 text-sm text-green-700">
+              Check your inbox for a magic sign-in link.
+            </p>
+          ) : (
+            <div className="flex gap-2">
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="you@email.com"
+                className="w-full rounded-lg border px-3 py-2 text-sm"
+              />
+              <Button
+                size="lg"
+                onClick={async () => {
+                  if (await signInEmail(email)) setEmailSent(true);
+                }}
+              >
+                <Mail className="h-4 w-4" /> Email link
+              </Button>
+            </div>
+          )}
           <Button onClick={signInGuest} variant="outline" size="lg">
             Continue as guest
           </Button>

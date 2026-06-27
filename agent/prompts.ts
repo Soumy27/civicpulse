@@ -53,7 +53,8 @@ Respond ONLY with JSON (no markdown, no preamble):
   "severity": "low"|"medium"|"high",
   "description": "One sentence, max 20 words, factual description",
   "department": "Responsible municipal department name",
-  "confidence": <integer 0-100, your certainty this is a real issue>
+  "confidence": <integer 0-100, your certainty this is a real issue>,
+  "entities": ["visible street names / landmarks / location markers, [] if none"]
 }
 Severity guide: low=minor inconvenience, medium=safety risk,
 high=immediate hazard or widespread damage.

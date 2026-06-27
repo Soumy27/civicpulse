@@ -1,10 +1,8 @@
 /**
- * Server-side auth helper. Verifies a Firebase ID token from the
- * Authorization: Bearer <token> header. Returns the uid, or null if absent /
- * invalid. Routes decide whether null is acceptable (demo) or a 401.
+ * Server-side auth: verify a Supabase access token from the
+ * Authorization: Bearer <token> header. Returns the uid, or null.
  */
-import { getAuth } from "firebase-admin/auth";
-import { adminApp } from "./firebase-admin";
+import { admin } from "./supabase-admin";
 
 export async function getUidFromRequest(req: Request): Promise<string | null> {
   const header = req.headers.get("authorization") ?? req.headers.get("Authorization");
@@ -12,10 +10,11 @@ export async function getUidFromRequest(req: Request): Promise<string | null> {
   const token = header.slice("Bearer ".length).trim();
   if (!token) return null;
   try {
-    const decoded = await getAuth(adminApp()).verifyIdToken(token);
-    return decoded.uid;
+    const { data, error } = await admin().auth.getUser(token);
+    if (error || !data.user) return null;
+    return data.user.id;
   } catch (err) {
-    console.error("ID token verification failed:", err);
+    console.error("token verification failed:", err);
     return null;
   }
 }

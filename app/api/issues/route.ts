@@ -1,22 +1,18 @@
 /**
  * POST /api/issues — create a civic issue from a classified report.
- *
- * Steps (per spec):
- *  1. Upload photo to Firebase Storage
- *  2. Create the Firestore issue document
- *  3. Increment the ward's totalReported counter
- *  4. Award 10 XP to reporter + recompute badge
- *  5. Recompute + persist the city Civic Score
- *  6. Publish to the Pub/Sub 'new-issues' topic
- *  7. Return { issueId }
+ *  1. Upload photo to Supabase Storage
+ *  2. Insert the issue row
+ *  3. Bump the ward's reported counter
+ *  4. Award 10 XP + recompute badge
+ *  5. Recompute + persist the Civic Score
+ *  6. Return { issueId }
  */
 import { NextResponse } from "next/server";
-import { db, bucket, FieldValue, Timestamp } from "@/lib/firebase-admin";
+import { admin, T } from "@/lib/supabase-admin";
 import { getUidFromRequest } from "@/lib/auth-server";
 import { recomputeAndPersistCivicScore } from "@/lib/civicScore";
-import { publishNewIssue } from "@/lib/pubsub";
 import { inferWardId } from "@/lib/maps";
-import { stripDataUrl, mimeFromDataUrl } from "@/lib/gemini";
+import { stripDataUrl, mimeFromDataUrl } from "@/lib/groq";
 import { badgeForXp, XP_FOR_REPORT } from "@/lib/xp";
 import { DEFAULT_DEPARTMENTS, type IssueCategory, type Severity } from "@/lib/types";
 import { randomUUID } from "node:crypto";
@@ -38,7 +34,7 @@ interface CreateIssueBody {
   extractedEntities?: string[];
   predictedResolutionMinDays?: number;
   predictedResolutionMaxDays?: number;
-  reporterId?: string; // demo fallback when no auth token
+  reporterId?: string;
 }
 
 export async function POST(req: Request): Promise<NextResponse> {
@@ -49,82 +45,57 @@ export async function POST(req: Request): Promise<NextResponse> {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  // Prefer a verified uid; fall back to demo reporterId so the flow works
-  // even with anonymous/no auth during a demo.
   const uid = (await getUidFromRequest(req)) ?? body.reporterId ?? "anonymous";
-
   const { lat, lng } = body;
   if (typeof lat !== "number" || typeof lng !== "number") {
     return NextResponse.json({ error: "lat/lng required" }, { status: 400 });
   }
 
+  const db = admin();
   const issueId = randomUUID();
   const wardId = body.wardId || inferWardId(lat, lng);
   const category = body.category ?? "other";
-  const now = Timestamp.now();
+  const now = new Date().toISOString();
+  const needsReview = (body.aiConfidence ?? 0) < 60;
 
-  // ── Step 1: upload photo ───────────────────────────────────
-  let photoUrl = "";
-  if (body.imageBase64) {
-    photoUrl = await uploadPhoto(issueId, body.imageBase64);
+  const photoUrl = body.imageBase64 ? await uploadPhoto(issueId, body.imageBase64) : "";
+
+  const { error } = await db.from(T.issues).insert({
+    id: issueId,
+    reporter_id: uid,
+    photo_url: photoUrl,
+    lat,
+    lng,
+    address: body.address ?? `${lat.toFixed(5)}, ${lng.toFixed(5)}`,
+    ward_id: wardId,
+    category,
+    severity: body.severity ?? "medium",
+    ai_description: body.aiDescription ?? "",
+    ai_confidence: body.aiConfidence ?? 0,
+    department: body.department || DEFAULT_DEPARTMENTS[category as IssueCategory],
+    extracted_entities: body.extractedEntities ?? [],
+    predicted_resolution_min_days: body.predictedResolutionMinDays ?? 0,
+    predicted_resolution_max_days: body.predictedResolutionMaxDays ?? 0,
+    status: needsReview ? "needs_review" : "reported",
+    created_at: now,
+    updated_at: now,
+  });
+  if (error) {
+    console.error("issue insert failed:", error);
+    return NextResponse.json({ error: "insert failed" }, { status: 500 });
   }
 
-  // ── Step 2: create issue document ──────────────────────────
-  const needsReview = (body.aiConfidence ?? 0) < 60;
-  await db()
-    .collection("issues")
-    .doc(issueId)
-    .set({
-      reporterId: uid,
-      photoUrl,
-      lat,
-      lng,
-      address: body.address ?? `${lat.toFixed(5)}, ${lng.toFixed(5)}`,
-      wardId,
-      category,
-      severity: body.severity ?? "medium",
-      aiDescription: body.aiDescription ?? "",
-      aiConfidence: body.aiConfidence ?? 0,
-      department: body.department || DEFAULT_DEPARTMENTS[category as IssueCategory],
-      extractedEntities: body.extractedEntities ?? [],
-      predictedResolutionMinDays: body.predictedResolutionMinDays ?? 0,
-      predictedResolutionMaxDays: body.predictedResolutionMaxDays ?? 0,
-      status: needsReview ? "needs_review" : "reported",
-      isPredicted: false,
-      verifierIds: [],
-      verificationCount: 0,
-      agentReviewCount: 0,
-      lastAgentReviewAt: null,
-      escalatedAt: null,
-      escalationDept: null,
-      escalationAttempts: 0,
-      mergedIntoIssueId: null,
-      createdAt: now,
-      updatedAt: now,
-    });
+  // Ward counter (read-modify-write; low contention).
+  const { data: ward } = await db.from(T.wards).select("total_reported").eq("ward_id", wardId).maybeSingle();
+  await db.from(T.wards).upsert({
+    ward_id: wardId,
+    ward_name: `Indore Ward ${wardId.split("-")[1] ?? ""}`,
+    total_reported: Number(ward?.total_reported ?? 0) + 1,
+    last_updated: now,
+  });
 
-  // ── Step 3: ward counter ───────────────────────────────────
-  await db()
-    .collection("wards")
-    .doc(wardId)
-    .set(
-      {
-        wardId,
-        wardName: `Indore Ward ${wardId.split("-")[1] ?? ""}`,
-        totalReported: FieldValue.increment(1),
-        lastUpdated: now,
-      },
-      { merge: true }
-    );
-
-  // ── Step 4: XP + badge ─────────────────────────────────────
   await awardXp(uid, XP_FOR_REPORT, issueId);
-
-  // ── Step 5: civic score ────────────────────────────────────
-  await recomputeAndPersistCivicScore().catch((e) => console.error("civicScore recompute:", e));
-
-  // ── Step 6: Pub/Sub ────────────────────────────────────────
-  await publishNewIssue(issueId, { category, severity: body.severity, wardId });
+  await recomputeAndPersistCivicScore().catch((e) => console.error("civicScore:", e));
 
   return NextResponse.json({ issueId, status: needsReview ? "needs_review" : "reported" });
 }
@@ -134,16 +105,16 @@ async function uploadPhoto(issueId: string, imageBase64: string): Promise<string
     const mime = imageBase64.startsWith("data:") ? mimeFromDataUrl(imageBase64) : "image/jpeg";
     const ext = mime.split("/")[1] ?? "jpg";
     const buffer = Buffer.from(stripDataUrl(imageBase64), "base64");
-    const file = bucket().file(`issues/${issueId}.${ext}`);
-    const token = randomUUID();
-    await file.save(buffer, {
-      metadata: { contentType: mime, metadata: { firebaseStorageDownloadTokens: token } },
-      resumable: false,
-    });
-    const encoded = encodeURIComponent(file.name);
-    return `https://firebasestorage.googleapis.com/v0/b/${bucket().name}/o/${encoded}?alt=media&token=${token}`;
+    const path = `${issueId}.${ext}`;
+    const db = admin();
+    const { error } = await db.storage.from("issues").upload(path, buffer, { contentType: mime, upsert: true });
+    if (error) {
+      console.error("photo upload failed:", error);
+      return "";
+    }
+    return db.storage.from("issues").getPublicUrl(path).data.publicUrl;
   } catch (err) {
-    console.error("photo upload failed:", err);
+    console.error("photo upload threw:", err);
     return "";
   }
 }
@@ -151,21 +122,19 @@ async function uploadPhoto(issueId: string, imageBase64: string): Promise<string
 async function awardXp(uid: string, amount: number, issueId: string): Promise<void> {
   if (uid === "anonymous") return;
   try {
-    const ref = db().collection("users").doc(uid);
-    await db().runTransaction(async (tx) => {
-      const snap = await tx.get(ref);
-      const prevXp = snap.exists ? Number(snap.data()?.xp ?? 0) : 0;
-      const xp = prevXp + amount;
-      tx.set(
-        ref,
-        {
-          uid,
-          xp,
-          badge: badgeForXp(xp),
-          reportedIssueIds: FieldValue.arrayUnion(issueId),
-        },
-        { merge: true }
-      );
+    const db = admin();
+    const { data } = await db.from(T.profiles).select("*").eq("uid", uid).maybeSingle();
+    const xp = Number(data?.xp ?? 0) + amount;
+    const reported = Array.isArray(data?.reported_issue_ids) ? (data!.reported_issue_ids as string[]) : [];
+    if (!reported.includes(issueId)) reported.push(issueId);
+    await db.from(T.profiles).upsert({
+      uid,
+      display_name: data?.display_name ?? "Citizen",
+      xp,
+      badge: badgeForXp(xp),
+      reported_issue_ids: reported,
+      verified_issue_ids: data?.verified_issue_ids ?? [],
+      ward_id: data?.ward_id ?? "",
     });
   } catch (err) {
     console.error("awardXp failed:", err);

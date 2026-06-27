@@ -1,22 +1,18 @@
 /**
- * POST /api/classify — Gemini Vision classification + NL entities + resolution
- * prediction + nearby-duplicate check.
- *
- * Every external call is wrapped so a single failure degrades gracefully
- * instead of returning an error screen (UX requirement).
+ * POST /api/classify — Groq Vision classification + resolution prediction +
+ * nearby-duplicate check. Every call degrades gracefully.
  */
 import { NextResponse } from "next/server";
 import {
   generateFromImage,
   generateText,
-  isGeminiConfigured,
+  isGroqConfigured,
   mimeFromDataUrl,
   parseJsonFromModel,
-} from "@/lib/gemini";
+} from "@/lib/groq";
 import { CLASSIFY_PROMPT, resolutionPredictionPrompt } from "@/agent/prompts";
-import { extractEntities } from "@/lib/natural-language";
-import { db } from "@/lib/firebase-admin";
-import { serializeIssue } from "@/lib/serialize";
+import { admin, T } from "@/lib/supabase-admin";
+import { rowToIssue } from "@/lib/serialize";
 import { boundingBox, withinRadius } from "@/lib/maps";
 import {
   DEFAULT_DEPARTMENTS,
@@ -42,6 +38,7 @@ interface RawClassification {
   description: string;
   department: string;
   confidence: number;
+  entities?: string[];
 }
 
 const VALID_CATEGORIES: IssueCategory[] = [
@@ -61,19 +58,15 @@ export async function POST(req: Request): Promise<NextResponse> {
   }
 
   const { imageBase64, lat, lng } = body;
-  if (!imageBase64) {
-    return NextResponse.json({ error: "imageBase64 required" }, { status: 400 });
-  }
+  if (!imageBase64) return NextResponse.json({ error: "imageBase64 required" }, { status: 400 });
 
-  // ── Step 1: Gemini Vision classification ───────────────────
   let parsed: RawClassification | null = null;
-  if (isGeminiConfigured()) {
+  if (isGroqConfigured()) {
     const mime = imageBase64.startsWith("data:") ? mimeFromDataUrl(imageBase64) : "image/jpeg";
     const raw = await generateFromImage(CLASSIFY_PROMPT, imageBase64, mime);
     if (raw) parsed = parseJsonFromModel<RawClassification>(raw);
   }
 
-  // Graceful fallback when Gemini is unavailable or returns junk.
   if (!parsed) {
     const fallback: ClassifyResult = {
       category: "other",
@@ -91,18 +84,15 @@ export async function POST(req: Request): Promise<NextResponse> {
     return NextResponse.json(fallback);
   }
 
-  // Normalize model output defensively.
-  const category: IssueCategory = VALID_CATEGORIES.includes(parsed.category)
-    ? parsed.category
-    : "other";
+  const category: IssueCategory = VALID_CATEGORIES.includes(parsed.category) ? parsed.category : "other";
   const severity: Severity = (["low", "medium", "high"] as Severity[]).includes(parsed.severity)
     ? parsed.severity
     : "medium";
   const confidence = Math.max(0, Math.min(100, Math.round(Number(parsed.confidence ?? 0))));
   const description = String(parsed.description ?? "").slice(0, 200);
   const department = parsed.department?.trim() || DEFAULT_DEPARTMENTS[category];
+  const extractedEntities = Array.isArray(parsed.entities) ? parsed.entities.slice(0, 6) : [];
 
-  // ── Step 2: low-confidence short-circuit ───────────────────
   if (confidence < 60) {
     const result: ClassifyResult = {
       category,
@@ -120,9 +110,7 @@ export async function POST(req: Request): Promise<NextResponse> {
     return NextResponse.json(result);
   }
 
-  // ── Steps 3-5 run concurrently (entities, prediction, dups) ─
-  const [extractedEntities, prediction, nearbyIssues] = await Promise.all([
-    extractEntities(description),
+  const [prediction, nearbyIssues] = await Promise.all([
     predictResolution(severity, category),
     findNearbyDuplicates(lat, lng, category),
   ]);
@@ -141,14 +129,10 @@ export async function POST(req: Request): Promise<NextResponse> {
   return NextResponse.json(result);
 }
 
-async function predictResolution(
-  severity: Severity,
-  category: IssueCategory
-): Promise<ResolutionPrediction> {
+async function predictResolution(severity: Severity, category: IssueCategory): Promise<ResolutionPrediction> {
   const fallback: ResolutionPrediction = { minDays: 3, maxDays: 7, confidence: 60 };
-  if (!isGeminiConfigured()) return fallback;
+  if (!isGroqConfigured()) return fallback;
   const raw = await generateText(resolutionPredictionPrompt(severity, category));
-  if (!raw) return fallback;
   const parsed = parseJsonFromModel<ResolutionPrediction>(raw);
   if (!parsed) return fallback;
   return {
@@ -158,22 +142,21 @@ async function predictResolution(
   };
 }
 
-/** Firestore bounding-box + haversine refine within 300m, same category. */
 async function findNearbyDuplicates(lat: number, lng: number, category: IssueCategory) {
   try {
     const box = boundingBox(lat, lng, 300);
-    const snap = await db()
-      .collection("issues")
-      .where("lat", ">=", box.minLat)
-      .where("lat", "<=", box.maxLat)
-      .get();
-    const candidates = snap.docs
-      .map((d) => serializeIssue(d.id, d.data() as Record<string, unknown>))
+    const { data } = await admin()
+      .from(T.issues)
+      .select("*")
+      .eq("category", category)
+      .gte("lat", box.minLat)
+      .lte("lat", box.maxLat);
+    const candidates = ((data ?? []) as Record<string, unknown>[])
+      .map(rowToIssue)
       .filter(
         (i) =>
           !i.isPredicted &&
           !i.mergedIntoIssueId &&
-          i.category === category &&
           i.lng >= box.minLng &&
           i.lng <= box.maxLng &&
           ["reported", "confirmed", "in_progress"].includes(i.status)

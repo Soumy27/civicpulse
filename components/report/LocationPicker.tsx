@@ -1,10 +1,15 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
-import { GoogleMap, Marker, Autocomplete } from "@react-google-maps/api";
-import { Crosshair, MapPin } from "lucide-react";
+import { useState } from "react";
+import dynamic from "next/dynamic";
+import { Crosshair, MapPin, Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { INDORE_CENTER, useGoogleMaps } from "@/lib/useGoogleMaps";
+import { reverseGeocode, searchPlaces } from "@/lib/maps";
+
+const LeafletPicker = dynamic(() => import("./LeafletPicker"), {
+  ssr: false,
+  loading: () => <div className="shimmer h-72 w-full rounded-xl" />,
+});
 
 export interface PickedLocation {
   lat: number;
@@ -12,35 +17,23 @@ export interface PickedLocation {
   address: string;
 }
 
-interface LocationPickerProps {
+export function LocationPicker({
+  value,
+  onChange,
+}: {
   value: PickedLocation;
   onChange: (loc: PickedLocation) => void;
-}
-
-const mapContainerStyle = { width: "100%", height: "320px", borderRadius: "0.75rem" };
-
-export function LocationPicker({ value, onChange }: LocationPickerProps) {
-  const { isLoaded, hasKey } = useGoogleMaps();
-  const autocompleteRef = useRef<google.maps.places.Autocomplete | null>(null);
+}) {
   const [locating, setLocating] = useState(false);
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<{ label: string; lat: number; lng: number }[]>([]);
+  const [searching, setSearching] = useState(false);
 
-  const reverseGeocode = useCallback(
-    (lat: number, lng: number) => {
-      if (typeof google === "undefined") {
-        onChange({ lat, lng, address: `${lat.toFixed(5)}, ${lng.toFixed(5)}` });
-        return;
-      }
-      const geocoder = new google.maps.Geocoder();
-      geocoder.geocode({ location: { lat, lng } }, (results, status) => {
-        const address =
-          status === "OK" && results?.[0]
-            ? results[0].formatted_address
-            : `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
-        onChange({ lat, lng, address });
-      });
-    },
-    [onChange]
-  );
+  const pick = async (lat: number, lng: number) => {
+    onChange({ lat, lng, address: value.address }); // optimistic
+    const address = await reverseGeocode(lat, lng);
+    onChange({ lat, lng, address });
+  };
 
   const useMyLocation = () => {
     setLocating(true);
@@ -50,7 +43,7 @@ export function LocationPicker({ value, onChange }: LocationPickerProps) {
     }
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        reverseGeocode(pos.coords.latitude, pos.coords.longitude);
+        pick(pos.coords.latitude, pos.coords.longitude);
         setLocating(false);
       },
       (err) => {
@@ -61,52 +54,12 @@ export function LocationPicker({ value, onChange }: LocationPickerProps) {
     );
   };
 
-  const onPlaceChanged = () => {
-    const place = autocompleteRef.current?.getPlace();
-    const loc = place?.geometry?.location;
-    if (loc) {
-      onChange({
-        lat: loc.lat(),
-        lng: loc.lng(),
-        address: place.formatted_address ?? place.name ?? "",
-      });
-    }
+  const runSearch = async () => {
+    if (!query.trim()) return;
+    setSearching(true);
+    setResults(await searchPlaces(query));
+    setSearching(false);
   };
-
-  // Graceful fallback when no Maps key — manual lat/lng entry.
-  if (!hasKey) {
-    return (
-      <div className="space-y-3 rounded-xl border bg-card p-4">
-        <p className="text-sm text-muted-foreground">
-          Maps unavailable (no API key). Enter coordinates manually:
-        </p>
-        <div className="grid grid-cols-2 gap-2">
-          <input
-            type="number"
-            step="any"
-            value={value.lat}
-            onChange={(e) => onChange({ ...value, lat: Number(e.target.value) })}
-            className="rounded-lg border px-3 py-2 text-sm"
-            placeholder="Latitude"
-          />
-          <input
-            type="number"
-            step="any"
-            value={value.lng}
-            onChange={(e) => onChange({ ...value, lng: Number(e.target.value) })}
-            className="rounded-lg border px-3 py-2 text-sm"
-            placeholder="Longitude"
-          />
-        </div>
-        <input
-          value={value.address}
-          onChange={(e) => onChange({ ...value, address: e.target.value })}
-          className="w-full rounded-lg border px-3 py-2 text-sm"
-          placeholder="Address"
-        />
-      </div>
-    );
-  }
 
   return (
     <div className="space-y-3">
@@ -115,45 +68,45 @@ export function LocationPicker({ value, onChange }: LocationPickerProps) {
           <Crosshair className={`h-4 w-4 ${locating ? "animate-spin" : ""}`} />
           {locating ? "Locating…" : "Use my location"}
         </Button>
-        {isLoaded && (
-          <Autocomplete
-            onLoad={(ac) => (autocompleteRef.current = ac)}
-            onPlaceChanged={onPlaceChanged}
-            className="flex-1"
-          >
+        <div className="relative flex-1">
+          <div className="flex gap-2">
             <input
-              placeholder="Search for an address or landmark"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && runSearch()}
+              placeholder="Search an address or landmark"
               className="w-full rounded-lg border px-3 py-2 text-sm"
             />
-          </Autocomplete>
-        )}
+            <Button variant="secondary" onClick={runSearch} disabled={searching} className="shrink-0">
+              <Search className="h-4 w-4" />
+            </Button>
+          </div>
+          {results.length > 0 && (
+            <ul className="absolute z-[1000] mt-1 max-h-56 w-full overflow-auto rounded-lg border bg-card shadow-lg">
+              {results.map((r, i) => (
+                <li key={i}>
+                  <button
+                    onClick={() => {
+                      onChange({ lat: r.lat, lng: r.lng, address: r.label });
+                      setResults([]);
+                      setQuery("");
+                    }}
+                    className="block w-full px-3 py-2 text-left text-sm hover:bg-accent"
+                  >
+                    {r.label}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       </div>
 
-      {isLoaded ? (
-        <GoogleMap
-          mapContainerStyle={mapContainerStyle}
-          center={{ lat: value.lat || INDORE_CENTER.lat, lng: value.lng || INDORE_CENTER.lng }}
-          zoom={16}
-          options={{ disableDefaultUI: true, zoomControl: true, gestureHandling: "greedy" }}
-          onClick={(e) => {
-            if (e.latLng) reverseGeocode(e.latLng.lat(), e.latLng.lng());
-          }}
-        >
-          <Marker
-            position={{ lat: value.lat || INDORE_CENTER.lat, lng: value.lng || INDORE_CENTER.lng }}
-            draggable
-            onDragEnd={(e) => {
-              if (e.latLng) reverseGeocode(e.latLng.lat(), e.latLng.lng());
-            }}
-          />
-        </GoogleMap>
-      ) : (
-        <div className="shimmer h-[320px] w-full rounded-xl" />
-      )}
+      <LeafletPicker lat={value.lat} lng={value.lng} onPick={pick} />
 
       <div className="flex items-start gap-2 rounded-lg bg-secondary p-3 text-sm">
         <MapPin className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-        <span>{value.address || "Drag the pin or search to set the exact location."}</span>
+        <span>{value.address || "Tap the map, search, or use your location to set the spot."}</span>
       </div>
     </div>
   );
