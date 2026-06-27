@@ -1,0 +1,47 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Issues: anyone can read (public civic map). Writes go through the
+    // server (Admin SDK bypasses rules), but allow a signed-in user to
+    // create their own report and append verifications client-side as a
+    // fallback if needed.
+    match /issues/{issueId} {
+      allow read: if true;
+      allow create: if signedIn() && request.resource.data.reporterId == request.auth.uid;
+      // Verification / agent mutations are server-side (Admin SDK).
+      allow update, delete: if false;
+    }
+
+    // Agent collections are read-only to clients; only the server writes.
+    match /agentActivity/{id} {
+      allow read: if true;
+      allow write: if false;
+    }
+    match /agentMemory/{id} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Public aggregate metrics.
+    match /cityMetrics/{id} {
+      allow read: if true;
+      allow write: if false;
+    }
+    match /wards/{id} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Users can read any profile but only write their own.
+    match /users/{uid} {
+      allow read: if true;
+      allow create, update: if signedIn() && request.auth.uid == uid;
+      allow delete: if false;
+    }
+  }
+}
